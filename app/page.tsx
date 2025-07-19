@@ -1,203 +1,163 @@
-"use client";
+'use client';
 
-import clsx from "clsx";
-import {
-	useActionState,
-	useEffect,
-	useRef,
-	useState,
-	startTransition,
-} from "react";
-import { toast } from "sonner";
-import { EnterIcon, LoadingIcon } from "@/lib/icons";
-import { usePlayer } from "@/lib/usePlayer";
-import { track } from "@vercel/analytics";
-import { useMicVAD, utils } from "@ricky0123/vad-react";
+import React, { useState, useEffect, useRef, useTransition } from 'react';
+import { Auth } from '@supabase/auth-ui-react';
+import { ThemeSupa } from '@supabase/auth-ui-shared';
+import { supabaseClient } from '@/lib/supabase/client';
+import { toast } from 'sonner';
+import { EnterIcon, LoadingIcon } from '@/lib/icons';
+import { usePlayer } from '@/lib/usePlayer';
+import { track } from '@vercel/analytics';
 
 type Message = {
-	role: "user" | "assistant";
-	content: string;
-	latency?: number;
+  role: 'user' | 'assistant';
+  content: string;
+  latency?: number;
 };
 
 export default function Home() {
-	const [input, setInput] = useState("");
-	const inputRef = useRef<HTMLInputElement>(null);
-	const player = usePlayer();
+  const [user, setUser] = useState<null | { id: string; email: string | null }>(null);
+  const [input, setInput] = useState('');
+  const inputRef = useRef<HTMLInputElement>(null);
+  const player = usePlayer();
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isPending, startTransition] = useTransition();
 
-	const vad = useMicVAD({
-		startOnLoad: true,
-		onSpeechEnd: (audio) => {
-			player.stop();
-			const wav = utils.encodeWAV(audio);
-			const blob = new Blob([wav], { type: "audio/wav" });
-			startTransition(() => submit(blob));
-			const isFirefox = navigator.userAgent.includes("Firefox");
-			if (isFirefox) vad.pause();
-		},
-		positiveSpeechThreshold: 0.6,
-		minSpeechFrames: 4,
-	});
+  // Listen for auth state changes & get initial user
+  useEffect(() => {
+    supabaseClient.auth.getUser().then(({ data: { user } }) => {
+      if (user) setUser({ id: user.id, email: user.email ?? null });
+    });
 
-	useEffect(() => {
-		function keyDown(e: KeyboardEvent) {
-			if (e.key === "Enter") return inputRef.current?.focus();
-			if (e.key === "Escape") return setInput("");
-		}
+    const { data: listener } = supabaseClient.auth.onAuthStateChange((_event, session) => {
+      if (session?.user) {
+        setUser({ id: session.user.id, email: session.user.email ?? null });
+      } else {
+        setUser(null);
+      }
+    });
 
-		window.addEventListener("keydown", keyDown);
-		return () => window.removeEventListener("keydown", keyDown);
-	});
+    return () => {
+      listener?.subscription.unsubscribe();
+    };
+  }, []);
 
-	const [messages, submit, isPending] = useActionState<
-		Array<Message>,
-		string | Blob
-	>(async (prevMessages, data) => {
-		const formData = new FormData();
+  async function signOut() {
+    await supabaseClient.auth.signOut();
+    setUser(null);
+    toast.success('Signed out');
+  }
 
-		if (typeof data === "string") {
-			formData.append("input", data);
-			track("Text input");
-		} else {
-			formData.append("input", data, "audio.wav");
-			track("Speech input");
-		}
+  async function submit(text: string) {
+    if (!user) {
+      toast.error('Please sign in first');
+      return;
+    }
 
-		for (const message of prevMessages) {
-			formData.append("message", JSON.stringify(message));
-		}
+    const formData = new FormData();
+    formData.append('input', text);
+    messages.forEach((message) => formData.append('message', JSON.stringify(message)));
 
-		const submittedAt = Date.now();
+    const submittedAt = Date.now();
+    const response = await fetch('/api', {
+      method: 'POST',
+      body: formData,
+    });
 
-		const response = await fetch("/api", {
-			method: "POST",
-			body: formData,
-		});
+    const transcript = decodeURIComponent(response.headers.get('X-Transcript') || '');
+    const textResponse = decodeURIComponent(response.headers.get('X-Response') || '');
 
-		const transcript = decodeURIComponent(
-			response.headers.get("X-Transcript") || ""
-		);
-		const text = decodeURIComponent(response.headers.get("X-Response") || "");
+    if (!response.ok || !transcript || !textResponse || !response.body) {
+      if (response.status === 429) toast.error('Too many requests. Please try again later.');
+      else toast.error((await response.text()) || 'An error occurred.');
+      return;
+    }
 
-		if (!response.ok || !transcript || !text || !response.body) {
-			if (response.status === 429) {
-				toast.error("Too many requests. Please try again later.");
-			} else {
-				toast.error((await response.text()) || "An error occurred.");
-			}
+    const latency = Date.now() - submittedAt;
 
-			return prevMessages;
-		}
+    player.play(response.body, () => {});
 
-		const latency = Date.now() - submittedAt;
-		player.play(response.body, () => {
-			const isFirefox = navigator.userAgent.includes("Firefox");
-			if (isFirefox) vad.start();
-		});
-		setInput(transcript);
+    setInput(transcript);
 
-		return [
-			...prevMessages,
-			{
-				role: "user",
-				content: transcript,
-			},
-			{
-				role: "assistant",
-				content: text,
-				latency,
-			},
-		];
-	}, []);
+    const newMessages: Message[] = [
+      ...messages,
+      { role: 'user', content: transcript },
+      { role: 'assistant', content: textResponse, latency },
+    ];
 
-	function handleFormSubmit(e: React.FormEvent) {
-		e.preventDefault();
-		startTransition(() => submit(input));
-	}
+    setMessages(newMessages);
+  }
 
-	return (
-		<>
-			<div className="pb-4 min-h-28" />
+  function handleFormSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    startTransition(() => submit(input));
+  }
 
-			<form
-				className="rounded-full bg-neutral-200/80 dark:bg-neutral-800/80 flex items-center w-full max-w-3xl border border-transparent hover:border-neutral-300 focus-within:border-neutral-400 hover:focus-within:border-neutral-400 dark:hover:border-neutral-700 dark:focus-within:border-neutral-600 dark:hover:focus-within:border-neutral-600"
-				onSubmit={handleFormSubmit}
-			>
-				<input
-					type="text"
-					className="bg-transparent focus:outline-hidden p-4 w-full placeholder:text-neutral-600 dark:placeholder:text-neutral-400"
-					required
-					placeholder="Ask me anything"
-					value={input}
-					onChange={(e) => setInput(e.target.value)}
-					ref={inputRef}
-				/>
+  return (
+    <>
+      {!user ? (
+        <div className="max-w-md mx-auto p-4">
+          <Auth
+            supabaseClient={supabaseClient}
+            appearance={{ theme: ThemeSupa }}
+            providers={[]} // add OAuth providers like 'google', 'github' if you want
+            redirectTo={window.location.origin}
+            socialLayout="horizontal"
+          />
+        </div>
+      ) : (
+        <>
+          <div className="max-w-md mx-auto p-4 border rounded-md bg-neutral-100 dark:bg-neutral-900 mb-6 flex justify-between items-center">
+            <span>
+              Signed in as <strong>{user.email ?? 'Unknown'}</strong>
+            </span>
+            <button
+              onClick={signOut}
+              className="py-1 px-3 bg-red-600 text-white rounded hover:bg-red-700"
+            >
+              Sign Out
+            </button>
+          </div>
 
-				<button
-					type="submit"
-					className="p-4 text-neutral-700 hover:text-black dark:text-neutral-300 dark:hover:text-white"
-					disabled={isPending}
-					aria-label="Submit"
-				>
-					{isPending ? <LoadingIcon /> : <EnterIcon />}
-				</button>
-			</form>
+          <form
+            className="rounded-full bg-neutral-200/80 dark:bg-neutral-800/80 flex items-center w-full max-w-3xl border border-transparent hover:border-neutral-300 focus-within:border-neutral-400 dark:hover:border-neutral-700 dark:focus-within:border-neutral-600"
+            onSubmit={handleFormSubmit}
+          >
+            <input
+              type="text"
+              className="bg-transparent focus:outline-hidden p-4 w-full placeholder:text-neutral-600 dark:placeholder:text-neutral-400"
+              required
+              placeholder="Ask me anything"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              ref={inputRef}
+              disabled={isPending}
+            />
+            <button
+              type="submit"
+              className="p-4 text-neutral-700 hover:text-black dark:text-neutral-300 dark:hover:text-white"
+              disabled={isPending}
+              aria-label="Submit"
+            >
+              {isPending ? <LoadingIcon /> : <EnterIcon />}
+            </button>
+          </form>
 
-			<div className="text-neutral-400 dark:text-neutral-600 pt-4 text-center max-w-xl text-balance min-h-28 space-y-4">
-				{messages.length > 0 && (
-					<p>
-						{messages.at(-1)?.content}
-						<span className="text-xs font-mono text-neutral-300 dark:text-neutral-700">
-							{" "}
-							({messages.at(-1)?.latency}ms)
-						</span>
-					</p>
-				)}
-
-				{messages.length === 0 && (
-					<>
-						<p>
-							A fast, open-source voice assistant powered by{" "}
-							<A href="https://groq.com">Groq</A>,{" "}
-							<A href="https://cartesia.ai">Cartesia</A>,{" "}
-							<A href="https://www.vad.ricky0123.com/">VAD</A>, and{" "}
-							<A href="https://vercel.com">Vercel</A>.{" "}
-							<A href="https://github.com/ai-ng/swift" target="_blank">
-								Learn more
-							</A>
-							.
-						</p>
-
-						{vad.loading ? (
-							<p>Loading speech detection...</p>
-						) : vad.errored ? (
-							<p>Failed to load speech detection.</p>
-						) : (
-							<p>Start talking to chat.</p>
-						)}
-					</>
-				)}
-			</div>
-
-			<div
-				className={clsx(
-					"absolute size-36 blur-3xl rounded-full bg-linear-to-b from-red-200 to-red-400 dark:from-red-600 dark:to-red-800 -z-50 transition ease-in-out",
-					{
-						"opacity-0": vad.loading || vad.errored,
-						"opacity-30": !vad.loading && !vad.errored && !vad.userSpeaking,
-						"opacity-100 scale-110": vad.userSpeaking,
-					}
-				)}
-			/>
-		</>
-	);
-}
-
-function A(props: any) {
-	return (
-		<a
-			{...props}
-			className="text-neutral-500 dark:text-neutral-500 hover:underline font-medium"
-		/>
-	);
+          <div className="text-neutral-400 dark:text-neutral-600 pt-4 text-center max-w-xl text-balance min-h-28 space-y-4 mx-auto">
+            {messages.length > 0 ? (
+              <p>
+                {messages.at(-1)?.content}
+                <span className="text-xs font-mono text-neutral-300 dark:text-neutral-700">
+                  {' '}
+                  ({messages.at(-1)?.latency}ms)
+                </span>
+              </p>
+            ) : (
+              <p>Start chatting by typing a message above.</p>
+            )}
+          </div>
+        </>
+      )}
+    </>
+  );
 }
